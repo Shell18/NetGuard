@@ -451,16 +451,41 @@ def main(page: ft.Page):
     page.window.on_close = on_window_close
 
     # ──────────────────────────────────────────────────
-    #  СПИСОК ИНТЕРФЕЙСОВ ДЛЯ DROPDOWN
+    #  СПИСОК ИНТЕРФЕЙСОВ ДЛЯ DROPDOWN ──────────────────
     # ──────────────────────────────────────────────────
     ifaces_list = list(conf.ifaces.values())
-    dropdown_options = [
-        ft.dropdown.Option(
-            key=iface.name,
-            text=f"{iface.description}  [{iface.ip or 'нет IP'}]"
+
+    # Поиск рекомендованного интерфейса
+    recommended_iface_name = None
+    for iface in ifaces_list:
+        ip = iface.ip or ""
+        desc = iface.description or ""
+        
+        # Критерии для рекомендации
+        starts_with_pref = ip.startswith("192.168.") or ip.startswith("10.")
+        has_exclude_word = any(
+            word.lower() in desc.lower() 
+            for word in ["virtual", "hyper-v", "loopback", "bluetooth"]
         )
-        for iface in ifaces_list
-    ]
+        
+        if starts_with_pref and not has_exclude_word:
+            recommended_iface_name = iface.name
+            break
+
+    dropdown_options = []
+    for iface in ifaces_list:
+        ip_str = f" [{iface.ip}]" if iface.ip else " [нет IP]"
+        if iface.name == recommended_iface_name:
+            text = f"⭐ РЕКОМЕНДУЕТСЯ (Активный Wi-Fi) — {iface.description}{ip_str}"
+        else:
+            text = f"{iface.description}{ip_str} (Служебный/Виртуальный)"
+            
+        dropdown_options.append(
+            ft.dropdown.Option(
+                key=iface.name,
+                text=text
+            )
+        )
 
     # ──────────────────────────────────────────────────
     #  ПОСТРОЕНИЕ UI
@@ -503,6 +528,7 @@ def main(page: ft.Page):
                     ref=iface_dropdown,
                     label="Сетевой интерфейс",
                     hint_text="Выберите интерфейс для мониторинга...",
+                    value=recommended_iface_name,
                     options=dropdown_options,
                     expand=True,
                     bgcolor=COLOR_PANEL,
