@@ -16,6 +16,7 @@ import time
 import ctypes
 import winsound
 import queue
+import socket
 import flet as ft
 
 # Flet 0.85+: Padding/Margin/Border/BorderSide доступны через ft напрямую
@@ -139,6 +140,19 @@ def ban_attacker(attacker_ip: str):
         pass
 
 
+def unban_attacker(attacker_ip: str):
+    """Разблокирует IP атакующего через Брандмауэр Windows."""
+    try:
+        cmd = (
+            f'netsh advfirewall firewall delete rule '
+            f'name="BLOCK_ARP_ATTACKER" remoteip={attacker_ip}'
+        )
+        subprocess.run(cmd, shell=True, check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
 def cleanup_firewall_rule():
     """Удаляет правило брандмауэра при закрытии приложения."""
     try:
@@ -216,6 +230,9 @@ def main(page: ft.Page):
     router_mac_text= ft.Ref[ft.Text]()
     status_panel   = ft.Ref[ft.Container]()
     log_list       = ft.Ref[ft.ListView]()
+    scan_btn       = ft.Ref[ft.Button]()
+    scan_status_text = ft.Ref[ft.Text]()
+    devices_table  = ft.Ref[ft.DataTable]()
 
     # ──────────────────────────────────────────────────
     #  ЛОГИРОВАНИЕ В UI (Буферизованное)
@@ -388,6 +405,199 @@ def main(page: ft.Page):
                 spacing=8, tight=True
             )
         page.update()
+
+    # ──────────────────────────────────────────────────
+    #  ИНТЕРАКТИВНЫЙ СКАНЕР СЕТИ (Этап 3)
+    # ──────────────────────────────────────────────────
+    def toggle_ban(e):
+        """Обработчик переключателя БАН / РАЗБАНИТЬ."""
+        ip = e.control.data
+        if e.control.content == "БАН":
+            ban_attacker(ip)
+            e.control.content = "РАЗБАНИТЬ"
+            e.control.bgcolor = ft.Colors.GREEN_700
+            add_log(f"[+] Устройство {ip} заблокировано вручную.", COLOR_DANGER, bold=True)
+        else:
+            unban_attacker(ip)
+            e.control.content = "БАН"
+            e.control.bgcolor = ft.Colors.RED_700
+            add_log(f"[-] Блокировка устройства {ip} снята вручную.", COLOR_TEXT_DIM)
+        e.control.update()
+
+    async def update_scanner_ui(devices, current_gw_ip):
+        """Обновление таблицы устройств в UI."""
+        if not devices_table.current:
+            return
+
+        devices_table.current.rows.clear()
+        for dev in devices:
+            ip = dev["ip"]
+            mac = dev["mac"]
+            name = dev["name"]
+
+            # Если это шлюз
+            if current_gw_ip and ip == current_gw_ip:
+                status = "ШЛЮЗ (РОУТЕР)"
+                action_cell = ft.DataCell(ft.Text("—", color=COLOR_TEXT_DIM))
+            else:
+                status = "Активен"
+                action_cell = ft.DataCell(
+                    ft.Button(
+                        content="БАН",
+                        bgcolor=ft.Colors.RED_700,
+                        color=ft.Colors.WHITE,
+                        data=ip,
+                        on_click=toggle_ban,
+                        style=ft.ButtonStyle(
+                            shape=ft.RoundedRectangleBorder(radius=6),
+                            padding=Padding(left=12, right=12, top=6, bottom=6),
+                        )
+                    )
+                )
+
+            devices_table.current.rows.append(
+                ft.DataRow(
+                    cells=[
+                        ft.DataCell(ft.Text(ip, color=COLOR_TEXT, size=13)),
+                        ft.DataCell(ft.Text(mac, color=COLOR_TEXT_DIM, size=13)),
+                        ft.DataCell(ft.Text(name, color=COLOR_TEXT, size=13)),
+                        ft.DataCell(ft.Text(status, color=COLOR_SUCCESS if status == "Активен" else COLOR_ACCENT, size=13)),
+                        action_cell,
+                    ]
+                )
+            )
+
+        if scan_status_text.current:
+            scan_status_text.current.value = f"Найдено устройств: {len(devices)}"
+
+        if scan_btn.current:
+            scan_btn.current.disabled = False
+            scan_btn.current.content = ft.Row(
+                [ft.Icon(ft.Icons.SEARCH, size=16),
+                 ft.Text("🔍 СКАНИРОВАТЬ СЕТЬ", size=14, weight=ft.FontWeight.BOLD)],
+                spacing=8, tight=True
+            )
+            scan_btn.current.bgcolor = COLOR_ACCENT_DIM
+
+        page.update()
+
+    async def restore_scanner_btn_ui():
+        """Восстановление кнопки сканирования при ошибке."""
+        if scan_btn.current:
+            scan_btn.current.disabled = False
+            scan_btn.current.content = ft.Row(
+                [ft.Icon(ft.Icons.SEARCH, size=16),
+                 ft.Text("🔍 СКАНИРОВАТЬ СЕТЬ", size=14, weight=ft.FontWeight.BOLD)],
+                spacing=8, tight=True
+            )
+            scan_btn.current.bgcolor = COLOR_ACCENT_DIM
+        page.update()
+
+    def network_scanner_worker():
+        """Фоновый поток пинг-свипа и разбора ARP-кэша."""
+        global gateway_ip
+        selected_key = iface_dropdown.current.value if iface_dropdown.current else None
+        if not selected_key:
+            add_log("[!] Выберите сетевой интерфейс в первой вкладке!", COLOR_DANGER)
+            page.run_task(restore_scanner_btn_ui)
+            return
+
+        # Находим IP адаптера
+        adapter_ip = None
+        for iface in list(conf.ifaces.values()):
+            iface_key = getattr(iface, "network_name", iface.name)
+            if iface_key == selected_key:
+                adapter_ip = iface.ip
+                break
+
+        if not adapter_ip or adapter_ip == "0.0.0.0":
+            add_log("[!] Выбранный интерфейс не имеет настроенного IP-адреса!", COLOR_DANGER)
+            page.run_task(restore_scanner_btn_ui)
+            return
+
+        parts = adapter_ip.split(".")
+        if len(parts) != 4:
+            add_log("[!] Некорректный IP-адрес интерфейса!", COLOR_DANGER)
+            page.run_task(restore_scanner_btn_ui)
+            return
+
+        subnet_prefix = ".".join(parts[:3])
+
+        # 1. Пинг-свип (254 потока)
+        add_log(f"[*] Сканирование подсети {subnet_prefix}.0/24...", COLOR_ACCENT)
+        threads = []
+        for i in range(1, 255):
+            target_ip = f"{subnet_prefix}.{i}"
+            t = threading.Thread(
+                target=lambda ip=target_ip: subprocess.run(
+                    ["ping", "-n", "1", "-w", "200", ip],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+            )
+            threads.append(t)
+            t.start()
+
+        for t in threads:
+            t.join()
+
+        # 2. Чтение кэша ARP
+        devices = []
+        try:
+            output = subprocess.check_output(["arp", "-a"], stderr=subprocess.DEVNULL)
+            decoded = output.decode("cp866", errors="ignore")
+            for line in decoded.splitlines():
+                if "dynamic" in line.lower() or "динамический" in line.lower():
+                    if subnet_prefix in line:
+                        ip_match = re.search(r"((?:[0-9]{1,3}\.){3}[0-9]{1,3})", line)
+                        mac_match = re.search(r"([0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}", line)
+                        if ip_match and mac_match:
+                            ip_val = ip_match.group(1)
+                            mac_val = mac_match.group(0).replace("-", ":").lower()
+                            if ip_val != adapter_ip:
+                                devices.append({"ip": ip_val, "mac": mac_val})
+        except Exception as ex:
+            add_log(f"[!] Ошибка чтения ARP-кэша: {ex}", COLOR_DANGER)
+
+        # 3. Конкурентное имя хоста
+        def resolve_name(dev):
+            try:
+                socket.setdefaulttimeout(0.5)
+                name_info = socket.gethostbyaddr(dev["ip"])
+                dev["name"] = name_info[0]
+            except Exception:
+                dev["name"] = "Неизвестное устройство"
+
+        resolve_threads = []
+        for dev in devices:
+            t = threading.Thread(target=resolve_name, args=(dev,))
+            resolve_threads.append(t)
+            t.start()
+
+        for t in resolve_threads:
+            t.join()
+
+        # Определяем IP шлюза, если он не определен глобально
+        current_gw_ip = gateway_ip
+        if not current_gw_ip:
+            current_gw_ip = get_gateway_ip(selected_key)
+
+        # 4. Передаем на UI
+        page.run_task(update_scanner_ui, devices, current_gw_ip)
+
+    def on_scan_click(e):
+        """Клик по кнопке сканирования."""
+        if scan_btn.current:
+            scan_btn.current.disabled = True
+            scan_btn.current.content = ft.Row(
+                [ft.ProgressRing(width=16, height=16, stroke_width=2, color=COLOR_ACCENT),
+                 ft.Text("Сканирование (около 3 сек)...", size=14, weight=ft.FontWeight.BOLD)],
+                spacing=8, tight=True
+            )
+            scan_btn.current.bgcolor = "#1A3A4A"
+            page.update()
+
+        threading.Thread(target=network_scanner_worker, daemon=True).start()
 
     # ──────────────────────────────────────────────────
     #  SCAPY ARP CALLBACK
@@ -909,14 +1119,87 @@ def main(page: ft.Page):
 
     # Вкладка 2: Мониторинг сети
     tab_monitoring_content = ft.Container(
-        content=ft.Text(
-            "Здесь будет интерактивная таблица пользователей для ручного бана (Этап 3)",
-            color=COLOR_TEXT_DIM,
-            size=16,
-            weight=ft.FontWeight.BOLD,
-            text_align=ft.TextAlign.CENTER,
+        content=ft.Column(
+            controls=[
+                # Верхняя панель управления сканированием
+                ft.Container(
+                    content=ft.Row(
+                        controls=[
+                            ft.Button(
+                                ref=scan_btn,
+                                content=ft.Row(
+                                    controls=[
+                                        ft.Icon(ft.Icons.SEARCH, size=16, color=COLOR_ACCENT),
+                                        ft.Text(
+                                            "🔍 СКАНИРОВАТЬ СЕТЬ",
+                                            size=14,
+                                            weight=ft.FontWeight.BOLD,
+                                            color=COLOR_ACCENT,
+                                        ),
+                                    ],
+                                    spacing=8,
+                                    tight=True,
+                                ),
+                                on_click=on_scan_click,
+                                bgcolor=COLOR_ACCENT_DIM,
+                                color=COLOR_ACCENT,
+                                height=50,
+                                style=ft.ButtonStyle(
+                                    shape=ft.RoundedRectangleBorder(radius=8),
+                                    padding=Padding(left=20, right=20, top=12, bottom=12),
+                                    overlay_color={"hovered": "#004A6A"},
+                                ),
+                            ),
+                            ft.Text(
+                                ref=scan_status_text,
+                                value="Найдено устройств: 0",
+                                color=COLOR_TEXT,
+                                size=15,
+                                weight=ft.FontWeight.BOLD,
+                            ),
+                        ],
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    ),
+                    padding=Padding(left=24, right=24, top=16, bottom=16),
+                    bgcolor=COLOR_PANEL,
+                    border=Border(bottom=BorderSide(1, COLOR_BORDER)),
+                ),
+                
+                # Таблица устройств
+                ft.Container(
+                    content=ft.Column(
+                        controls=[
+                            ft.ListView(
+                                controls=[
+                                    ft.DataTable(
+                                        ref=devices_table,
+                                        columns=[
+                                            ft.DataColumn(ft.Text("IP-АДРЕС", color=COLOR_ACCENT, weight=ft.FontWeight.BOLD)),
+                                            ft.DataColumn(ft.Text("MAC-АДРЕС", color=COLOR_ACCENT, weight=ft.FontWeight.BOLD)),
+                                            ft.DataColumn(ft.Text("ИМЯ УСТРОЙСТВА", color=COLOR_ACCENT, weight=ft.FontWeight.BOLD)),
+                                            ft.DataColumn(ft.Text("СТАТУС", color=COLOR_ACCENT, weight=ft.FontWeight.BOLD)),
+                                            ft.DataColumn(ft.Text("УПРАВЛЕНИЕ", color=COLOR_ACCENT, weight=ft.FontWeight.BOLD)),
+                                        ],
+                                        rows=[],
+                                        heading_row_color=COLOR_PANEL,
+                                        divider_thickness=1,
+                                    )
+                                ],
+                                expand=True,
+                                spacing=0,
+                            )
+                        ],
+                        expand=True,
+                    ),
+                    padding=Padding(left=24, right=24, top=16, bottom=16),
+                    bgcolor=COLOR_BG,
+                    expand=True,
+                )
+            ],
+            spacing=0,
+            expand=True,
         ),
-        alignment=ft.Alignment(0, 0),
+        bgcolor=COLOR_BG,
         expand=True,
     )
 
