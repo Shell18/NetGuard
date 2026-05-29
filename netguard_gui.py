@@ -476,7 +476,7 @@ def main(page: ft.Page):
     for iface in ifaces_list:
         ip_str = f" [{iface.ip}]" if iface.ip else " [нет IP]"
         if iface.name == recommended_iface_name:
-            text = f"⭐ РЕКОМЕНДУЕТСЯ (Активный Wi-Fi) — {iface.description}{ip_str}"
+            text = f"⭐ РЕКОМЕНДУЕТСЯ (Активная Сеть) — {iface.description}{ip_str}"
         else:
             text = f"{iface.description}{ip_str} (Служебный/Виртуальный)"
             
