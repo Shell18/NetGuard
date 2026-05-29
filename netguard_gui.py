@@ -365,6 +365,12 @@ def main(page: ft.Page):
         global gateway_ip, gateway_mac, selected_iface_name
         global sniffer_active, antidote_active, sniff_thread
 
+        # Сброс сетевого кэша Scapy в главном GUI-потоке при клике на кнопку
+        try:
+            conf.route.resync()
+        except Exception as ex:
+            pass
+
         if sniffer_active:
             # ОСТАНОВКА ВСЕГО
             sniffer_active = False
@@ -424,13 +430,6 @@ def main(page: ft.Page):
 
             selected_iface_name = iface_dropdown.current.value
             antidote_active     = False
-
-            # Сброс сетевого кэша Scapy
-            add_log("[*] Сброс сетевого кэша Scapy...", COLOR_TEXT_DIM)
-            try:
-                conf.route.resync()
-            except Exception as ex:
-                add_log(f"[!] Не удалось сбросить кэш Scapy: {ex}", COLOR_TEXT_DIM)
 
             # Шаг 1: определяем IP шлюза
             add_log("[*] Определение IP-адреса шлюза по умолчанию...", COLOR_ACCENT)
@@ -811,19 +810,60 @@ def main(page: ft.Page):
         expand=True,
     )
 
-    # ── Итоговая компоновка ───────────────────────────
-    page.add(
-        ft.Column(
-            controls=[
-                header,
-                control_row,
-                status_panel_widget,
-                log_panel_widget,
-            ],
+    # ── Итоговая компоновка с вкладками (Tabs) ─────────
+    # Вкладка 1: Активная защита
+    tab_protection_content = ft.Column(
+        controls=[
+            header,
+            control_row,
+            status_panel_widget,
+            log_panel_widget,
+        ],
+        expand=True,
+        spacing=0,
+    )
+
+    # Вкладка 2: Мониторинг сети
+    tab_monitoring_content = ft.Container(
+        content=ft.Text(
+            "Здесь будет интерактивная таблица пользователей для ручного бана (Этап 3)",
+            color=COLOR_TEXT_DIM,
+            size=16,
+            weight=ft.FontWeight.BOLD,
+            text_align=ft.TextAlign.CENTER,
+        ),
+        alignment=ft.Alignment(0, 0),
+        expand=True,
+    )
+
+    tabs = ft.Tabs(
+        length=2,
+        expand=True,
+        content=ft.Column(
             expand=True,
             spacing=0,
+            controls=[
+                ft.TabBar(
+                    tabs=[
+                        ft.Tab(label="🛡️ Активная Защита"),
+                        ft.Tab(label="👥 Мониторинг Сети (Устройства)"),
+                    ],
+                    label_color=COLOR_ACCENT,
+                    unselected_label_color=COLOR_TEXT_DIM,
+                    indicator_color=COLOR_ACCENT,
+                ),
+                ft.TabBarView(
+                    expand=True,
+                    controls=[
+                        tab_protection_content,
+                        tab_monitoring_content,
+                    ]
+                )
+            ]
         )
     )
+
+    page.add(tabs)
 
     # ──────────────────────────────────────────────────
     #  ДИАЛОГ "НЕТ ПРАВ АДМИНИСТРАТОРА"
