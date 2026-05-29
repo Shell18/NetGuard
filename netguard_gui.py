@@ -16,9 +16,12 @@ import time
 import ctypes
 import winsound
 import flet as ft
-from flet.padding import Padding
-from flet.margin import Margin
-from flet.border import Border, BorderSide
+
+# Flet 0.85+: Padding/Margin/Border/BorderSide доступны через ft напрямую
+Padding   = ft.Padding
+Margin    = ft.Margin
+Border    = ft.Border
+BorderSide = ft.BorderSide
 from scapy.all import sniff, ARP, conf, Ether, srp1, sendp
 
 # ──────────────────────────────────────────────────
