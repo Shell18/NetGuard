@@ -1,11 +1,15 @@
 import sys
 import subprocess
 import re
-from scapy.all import sniff, ARP, conf, Ether, srp1
+import threading
+import time
+from scapy.all import sniff, ARP, conf, Ether, srp1, sendp
 
 # Глобальные переменные эталона (White Reference)
 gateway_ip = None
 gateway_mac = None
+selected_iface_name = None
+antidote_started = False
 
 def get_gateway_ip():
     """
@@ -85,6 +89,76 @@ def get_gateway_mac(ip_address, iface_name):
             print("\n[!] Отменено пользователем.")
             sys.exit(0)
 
+def get_ip_from_arp_cache(mac_address):
+    """
+    Ищет IP-адрес по заданному MAC-адресу в системном кэше ARP.
+    """
+    try:
+        # Приводим MAC к единому виду для сравнения (Windows arp -a использует дефисы)
+        mac_normalized = mac_address.lower().replace(":", "-")
+        output = subprocess.check_output(["arp", "-a"], stderr=subprocess.DEVNULL)
+        decoded_output = output.decode("cp866", errors="ignore")
+        
+        for line in decoded_output.splitlines():
+            if mac_normalized in line.lower():
+                # Регулярка для извлечения IP-адреса (первое совпадение в строке)
+                ip_match = re.search(r"((?:[0-9]{1,3}\.){3}[0-9]{1,3})", line)
+                if ip_match:
+                    return ip_match.group(1)
+    except Exception as e:
+        print(f"[!] Ошибка при поиске IP по MAC в кэше: {e}")
+    return None
+
+def ban_attacker(attacker_ip):
+    """
+    Локально блокирует IP-адрес атакующего через Брандмауэр Windows.
+    """
+    print(f"[+] Запущена функция БАНА для IP: {attacker_ip}")
+    try:
+        # Добавляем правило блокировки в брандмауэр Windows
+        cmd = f'netsh advfirewall firewall add rule name="BLOCK_ARP_ATTACKER" dir=in action=block remoteip={attacker_ip}'
+        subprocess.run(cmd, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print(f"[+] IP {attacker_ip} успешно заблокирован в Брандмауэре Windows.")
+    except Exception as e:
+        print(f"[-] Не удалось заблокировать IP {attacker_ip} через Брандмауэр: {e}")
+
+def antidote_worker(router_ip, real_router_mac, iface_name):
+    """
+    Фоновый поток антидота. Каждые 0.5 секунд рассылает легитимные ARP-ответы.
+    """
+    print("[+] АКТИВИРОВАН ARP-АНТИДОТ: Подавление атаки в локальной сети...")
+    
+    # Собираем легитимный ARP-ответ
+    # Ether dst = широковещательный
+    # ARP psrc = IP шлюза, hwsrc = реальный MAC шлюза, pdst = широковещательный
+    pkt = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(
+        op=2,
+        psrc=router_ip,
+        hwsrc=real_router_mac,
+        pdst="255.255.255.255"
+    )
+    
+    while True:
+        try:
+            sendp(pkt, iface=iface_name, verbose=False)
+        except Exception:
+            pass
+        time.sleep(0.5)
+
+def start_antidote(router_ip, real_router_mac):
+    """
+    Запускает фоновый поток для отправки легитимных ARP-ответов.
+    """
+    global antidote_started, selected_iface_name
+    if not antidote_started:
+        antidote_started = True
+        t = threading.Thread(
+            target=antidote_worker,
+            args=(router_ip, real_router_mac, selected_iface_name),
+            daemon=True
+        )
+        t.start()
+
 def show_interfaces():
     """
     Получает список всех сетевых интерфейсов через conf.ifaces,
@@ -142,6 +216,7 @@ def arp_callback(packet):
     Разбирает структуру ARP-пакета и выполняет детекцию ARP-spoofing'а.
     Обернута в try-except для устойчивости к ошибкам.
     """
+    global gateway_ip, gateway_mac, selected_iface_name
     try:
         # Проверяем, содержит ли перехваченный пакет слой ARP.
         if ARP in packet:
@@ -171,6 +246,16 @@ def arp_callback(packet):
                         print(f"\033[91m    Ожидаемый MAC (эталон):  {gateway_mac}\033[0m")
                         print(f"\033[91m    Атакующий MAC (текущий): {src_mac}\033[0m")
                         print("=" * 80 + "\n")
+                        
+                        # 1. Попытка заблокировать IP атакующего
+                        attacker_ip = get_ip_from_arp_cache(src_mac)
+                        if attacker_ip:
+                            ban_attacker(attacker_ip)
+                        else:
+                            print(f"[-] Не удалось определить IP-адрес атакующего по MAC {src_mac} (возможно, это вымышленный адрес/тест).")
+                        
+                        # 2. Запуск ARP-Антидота
+                        start_antidote(gateway_ip, gateway_mac)
             else:
                 # Другие редкие типы
                 print(f"[ARP ДРУГОЕ (op={op_code})] {src_ip} ({src_mac}) -> {dst_ip}")
@@ -179,7 +264,7 @@ def arp_callback(packet):
         print(f"[!] Ошибка при парсинге пакета: {e}")
 
 def main():
-    global gateway_ip, gateway_mac
+    global gateway_ip, gateway_mac, selected_iface_name
     
     print("=" * 60)
     print("      ARP детектор спуфинга на Scapy (для ОС Windows)")
@@ -189,6 +274,7 @@ def main():
         # 1. Получаем список интерфейсов и даем пользователю выбрать нужный
         ifaces = show_interfaces()
         selected_iface = select_interface(ifaces)
+        selected_iface_name = selected_iface.name
         
         # 2. Детектируем шлюз по умолчанию
         print("\n[*] Определение IP-адреса шлюза по умолчанию...")
