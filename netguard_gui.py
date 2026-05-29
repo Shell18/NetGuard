@@ -178,7 +178,7 @@ def main(page: ft.Page):
     #  REF-ССЫЛКИ НА КОНТРОЛЫ ДЛЯ ОБНОВЛЕНИЯ ИЗ ПОТОКОВ
     # ──────────────────────────────────────────────────
     iface_dropdown = ft.Ref[ft.Dropdown]()
-    start_btn      = ft.Ref[ft.ElevatedButton]()
+    start_btn      = ft.Ref[ft.Button]()
     status_text    = ft.Ref[ft.Text]()
     router_ip_text = ft.Ref[ft.Text]()
     router_mac_text= ft.Ref[ft.Text]()
@@ -339,7 +339,7 @@ def main(page: ft.Page):
 
         # Блокируем кнопку на время инициализации
         start_btn.current.disabled = True
-        start_btn.current.text = "Инициализация..."
+        start_btn.current.content = ft.Text("Инициализация...", size=14, weight=ft.FontWeight.BOLD)
         start_btn.current.bgcolor = "#1A3A4A"
         page.update()
 
@@ -361,7 +361,10 @@ def main(page: ft.Page):
             if not gw_ip:
                 add_log("[!] Не удалось определить IP шлюза автоматически.", COLOR_DANGER, bold=True)
                 start_btn.current.disabled = False
-                start_btn.current.text = "ВКЛЮЧИТЬ ЗАЩИТУ"
+                start_btn.current.content = ft.Row(
+                    [ft.Icon(ft.Icons.SHIELD, size=16), ft.Text("ВКЛЮЧИТЬ ЗАЩИТУ", size=14, weight=ft.FontWeight.BOLD)],
+                    spacing=8, tight=True
+                )
                 start_btn.current.bgcolor = COLOR_ACCENT_DIM
                 page.update()
                 return
@@ -375,7 +378,10 @@ def main(page: ft.Page):
             if not gw_mac:
                 add_log("[!] Не удалось определить MAC шлюза.", COLOR_DANGER, bold=True)
                 start_btn.current.disabled = False
-                start_btn.current.text = "ВКЛЮЧИТЬ ЗАЩИТУ"
+                start_btn.current.content = ft.Row(
+                    [ft.Icon(ft.Icons.SHIELD, size=16), ft.Text("ВКЛЮЧИТЬ ЗАЩИТУ", size=14, weight=ft.FontWeight.BOLD)],
+                    spacing=8, tight=True
+                )
                 start_btn.current.bgcolor = COLOR_ACCENT_DIM
                 page.update()
                 return
@@ -397,7 +403,11 @@ def main(page: ft.Page):
                 bottom=BorderSide(2, COLOR_SUCCESS),
                 left=BorderSide(2, COLOR_SUCCESS),
             )
-            start_btn.current.text    = "● ЗАЩИТА АКТИВНА"
+            start_btn.current.content = ft.Row(
+                [ft.Icon(ft.Icons.VERIFIED_USER, size=16, color=COLOR_SUCCESS),
+                 ft.Text("● ЗАЩИТА АКТИВНА", size=14, weight=ft.FontWeight.BOLD, color=COLOR_SUCCESS)],
+                spacing=8, tight=True
+            )
             start_btn.current.bgcolor = "#003D1A"
             start_btn.current.color   = COLOR_SUCCESS
             # Один вызов page.update() для всех изменённых контролов
@@ -501,10 +511,21 @@ def main(page: ft.Page):
                     focused_border_color=COLOR_ACCENT,
                     label_style=ft.TextStyle(color=COLOR_TEXT_DIM),
                 ),
-                ft.ElevatedButton(
+                ft.Button(
                     ref=start_btn,
-                    text="ВКЛЮЧИТЬ ЗАЩИТУ",
-                    icon=ft.Icons.SHIELD,
+                    content=ft.Row(
+                        controls=[
+                            ft.Icon(ft.Icons.SHIELD, size=16, color=COLOR_ACCENT),
+                            ft.Text(
+                                "ВКЛЮЧИТЬ ЗАЩИТУ",
+                                size=14,
+                                weight=ft.FontWeight.BOLD,
+                                color=COLOR_ACCENT,
+                            ),
+                        ],
+                        spacing=8,
+                        tight=True,
+                    ),
                     on_click=on_start_protection,
                     bgcolor=COLOR_ACCENT_DIM,
                     color=COLOR_ACCENT,
@@ -512,10 +533,6 @@ def main(page: ft.Page):
                     style=ft.ButtonStyle(
                         shape=ft.RoundedRectangleBorder(radius=8),
                         padding=Padding(left=24, right=24, top=14, bottom=14),
-                        text_style=ft.TextStyle(
-                            size=14,
-                            weight=ft.FontWeight.BOLD,
-                        ),
                         overlay_color={"hovered": "#004A6A"},
                     ),
                 ),
