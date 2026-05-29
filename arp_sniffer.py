@@ -9,7 +9,8 @@ from scapy.all import sniff, ARP, conf, Ether, srp1, sendp
 gateway_ip = None
 gateway_mac = None
 selected_iface_name = None
-antidote_started = False
+sniffer_active = False
+antidote_active = False
 
 def get_gateway_ip():
     """
@@ -126,6 +127,7 @@ def antidote_worker(router_ip, real_router_mac, iface_name):
     """
     Фоновый поток антидота. Каждые 0.5 секунд рассылает легитимные ARP-ответы.
     """
+    global antidote_active
     print("[+] АКТИВИРОВАН ARP-АНТИДОТ: Подавление атаки в локальной сети...")
     
     # Собираем легитимный ARP-ответ
@@ -138,7 +140,7 @@ def antidote_worker(router_ip, real_router_mac, iface_name):
         pdst="255.255.255.255"
     )
     
-    while True:
+    while antidote_active:
         try:
             sendp(pkt, iface=iface_name, verbose=False)
         except Exception:
@@ -149,9 +151,9 @@ def start_antidote(router_ip, real_router_mac):
     """
     Запускает фоновый поток для отправки легитимных ARP-ответов.
     """
-    global antidote_started, selected_iface_name
-    if not antidote_started:
-        antidote_started = True
+    global antidote_active, selected_iface_name
+    if not antidote_active:
+        antidote_active = True
         t = threading.Thread(
             target=antidote_worker,
             args=(router_ip, real_router_mac, selected_iface_name),
@@ -278,6 +280,7 @@ def main():
         
         # 2. Детектируем шлюз по умолчанию
         print("\n[*] Определение IP-адреса шлюза по умолчанию...")
+        conf.route.resync()  # Сброс сетевого кэша Scapy
         detected_ip = get_gateway_ip()
         if detected_ip:
             print(f"[+] Обнаружен IP-адрес шлюза: {detected_ip}")
@@ -309,9 +312,13 @@ def main():
         print("[*] Нажмите Ctrl+C для остановки программы.\n")
         print("-" * 60)
         
+        # Включаем флаг активности сниффера
+        global sniffer_active
+        sniffer_active = True
+        
         # 4. Запускаем бесконечный sniff()
         # count=0 означает бесконечный захват
-        sniff(iface=selected_iface.name, filter="arp", prn=arp_callback, store=0, count=0)
+        sniff(iface=selected_iface.name, filter="arp", prn=arp_callback, store=0, count=0, stop_filter=lambda p: not sniffer_active)
         
     except PermissionError:
         print("\n[-] Ошибка прав доступа!")
