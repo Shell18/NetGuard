@@ -365,12 +365,6 @@ def main(page: ft.Page):
         global gateway_ip, gateway_mac, selected_iface_name
         global sniffer_active, antidote_active, sniff_thread
 
-        # Сброс сетевого кэша Scapy в главном GUI-потоке при клике на кнопку
-        try:
-            conf.route.resync()
-        except Exception as ex:
-            pass
-
         if sniffer_active:
             # ОСТАНОВКА ВСЕГО
             sniffer_active = False
@@ -424,79 +418,85 @@ def main(page: ft.Page):
         start_btn.current.bgcolor = "#1A3A4A"
         page.update()
 
-        def init_and_sniff():
-            global gateway_ip, gateway_mac, selected_iface_name
-            global sniffer_active, antidote_active, sniff_thread
+        # 1. Сброс сетевого кэша Scapy в главном GUI-потоке при клике на кнопку
+        try:
+            conf.route.resync()
+        except Exception as ex:
+            add_log(f"[!] Не удалось сбросить кэш Scapy: {ex}", COLOR_TEXT_DIM)
 
-            selected_iface_name = iface_dropdown.current.value
-            antidote_active     = False
+        # 2. Микропауза 0.3 сек для обновления таблиц в Windows
+        time.sleep(0.3)
 
-            # Шаг 1: определяем IP шлюза
-            add_log("[*] Определение IP-адреса шлюза по умолчанию...", COLOR_ACCENT)
-            gw_ip = get_gateway_ip()
-            if not gw_ip:
-                add_log("[!] Не удалось определить IP шлюза автоматически.", COLOR_DANGER, bold=True)
-                start_btn.current.disabled = False
-                start_btn.current.content = ft.Row(
-                    [ft.Icon(ft.Icons.SHIELD, size=16), ft.Text("ВКЛЮЧИТЬ ЗАЩИТУ", size=14, weight=ft.FontWeight.BOLD)],
-                    spacing=8, tight=True
-                )
-                start_btn.current.bgcolor = COLOR_ACCENT_DIM
-                page.update()
-                return
+        selected_iface_name = iface_dropdown.current.value
+        antidote_active     = False
 
-            gateway_ip = gw_ip
-            add_log(f"[+] Шлюз обнаружен: {gateway_ip}", COLOR_SUCCESS)
-
-            # Шаг 2: определяем эталонный MAC шлюза
-            add_log(f"[*] Получение эталонного MAC-адреса для {gateway_ip}...", COLOR_ACCENT)
-            gw_mac = get_gateway_mac(gateway_ip, selected_iface_name)
-            if not gw_mac:
-                add_log("[!] Не удалось определить MAC шлюза.", COLOR_DANGER, bold=True)
-                start_btn.current.disabled = False
-                start_btn.current.content = ft.Row(
-                    [ft.Icon(ft.Icons.SHIELD, size=16), ft.Text("ВКЛЮЧИТЬ ЗАЩИТУ", size=14, weight=ft.FontWeight.BOLD)],
-                    spacing=8, tight=True
-                )
-                start_btn.current.bgcolor = COLOR_ACCENT_DIM
-                page.update()
-                return
-
-            gateway_mac = gw_mac
-            sniffer_active = True
-
-            # Обновление UI
-            router_ip_text.current.value  = f"IP роутера:   {gateway_ip}"
-            router_mac_text.current.value = f"MAC эталон:  {gateway_mac}"
-            status_text.current.value     = "🛡  Сеть под защитой"
-            status_text.current.color     = COLOR_SUCCESS
-            status_text.current.size      = 22
-            status_panel.current.bgcolor  = COLOR_SUCCESS_BG
-            status_panel.current.border   = Border(
-                top=BorderSide(2, COLOR_SUCCESS),
-                right=BorderSide(2, COLOR_SUCCESS),
-                bottom=BorderSide(2, COLOR_SUCCESS),
-                left=BorderSide(2, COLOR_SUCCESS),
-            )
-            
-            # Меняем кнопку запуска на кнопку остановки (красная)
+        # 3. Определение IP шлюза в главном потоке
+        add_log("[*] Определение IP-адреса шлюза по умолчанию...", COLOR_ACCENT)
+        gw_ip = get_gateway_ip()
+        if not gw_ip:
+            add_log("[!] Не удалось определить IP шлюза автоматически.", COLOR_DANGER, bold=True)
             start_btn.current.disabled = False
             start_btn.current.content = ft.Row(
-                [ft.Icon(ft.Icons.SHIELD, size=16, color=ft.colors.WHITE),
-                 ft.Text("🛑 ОСТАНОВИТЬ ЗАЩИТУ", size=14, weight=ft.FontWeight.BOLD, color=ft.colors.WHITE)],
+                [ft.Icon(ft.Icons.SHIELD, size=16), ft.Text("ВКЛЮЧИТЬ ЗАЩИТУ", size=14, weight=ft.FontWeight.BOLD)],
                 spacing=8, tight=True
             )
-            start_btn.current.bgcolor = COLOR_DANGER
-            start_btn.current.color = ft.colors.WHITE
+            start_btn.current.bgcolor = COLOR_ACCENT_DIM
             page.update()
+            return
 
-            add_log(f"[+] Эталонный MAC зафиксирован: {gateway_mac}", COLOR_SUCCESS, bold=True)
-            add_log("─" * 58, COLOR_TEXT_DIM)
-            add_log("[*] Активный мониторинг ARP-трафика запущен...", COLOR_ACCENT, bold=True)
-            add_log("[*] Закройте окно для завершения.", COLOR_TEXT_DIM)
-            add_log("─" * 58, COLOR_TEXT_DIM)
+        gateway_ip = gw_ip
+        add_log(f"[+] Шлюз обнаружен: {gateway_ip}", COLOR_SUCCESS)
 
-            # Шаг 3: запускаем sniff()
+        # 4. Определение эталонного MAC шлюза в главном потоке
+        add_log(f"[*] Получение эталонного MAC-адреса для {gateway_ip}...", COLOR_ACCENT)
+        gw_mac = get_gateway_mac(gateway_ip, selected_iface_name)
+        if not gw_mac:
+            add_log("[!] Не удалось определить MAC шлюза.", COLOR_DANGER, bold=True)
+            start_btn.current.disabled = False
+            start_btn.current.content = ft.Row(
+                [ft.Icon(ft.Icons.SHIELD, size=16), ft.Text("ВКЛЮЧИТЬ ЗАЩИТУ", size=14, weight=ft.FontWeight.BOLD)],
+                spacing=8, tight=True
+            )
+            start_btn.current.bgcolor = COLOR_ACCENT_DIM
+            page.update()
+            return
+
+        gateway_mac = gw_mac
+        sniffer_active = True
+
+        # Обновление UI в главном потоке
+        router_ip_text.current.value  = f"IP роутера:   {gateway_ip}"
+        router_mac_text.current.value = f"MAC эталон:  {gateway_mac}"
+        status_text.current.value     = "🛡  Сеть под защитой"
+        status_text.current.color     = COLOR_SUCCESS
+        status_text.current.size      = 22
+        status_panel.current.bgcolor  = COLOR_SUCCESS_BG
+        status_panel.current.border   = Border(
+            top=BorderSide(2, COLOR_SUCCESS),
+            right=BorderSide(2, COLOR_SUCCESS),
+            bottom=BorderSide(2, COLOR_SUCCESS),
+            left=BorderSide(2, COLOR_SUCCESS),
+        )
+        
+        # Меняем кнопку запуска на кнопку остановки (красная)
+        start_btn.current.disabled = False
+        start_btn.current.content = ft.Row(
+            [ft.Icon(ft.Icons.SHIELD, size=16, color=ft.colors.WHITE),
+             ft.Text("🛑 ОСТАНОВИТЬ ЗАЩИТУ", size=14, weight=ft.FontWeight.BOLD, color=ft.colors.WHITE)],
+            spacing=8, tight=True
+        )
+        start_btn.current.bgcolor = COLOR_DANGER
+        start_btn.current.color = ft.colors.WHITE
+        page.update()
+
+        add_log(f"[+] Эталонный MAC зафиксирован: {gateway_mac}", COLOR_SUCCESS, bold=True)
+        add_log("─" * 58, COLOR_TEXT_DIM)
+        add_log("[*] Активный мониторинг ARP-трафика запущен...", COLOR_ACCENT, bold=True)
+        add_log("[*] Закройте окно для завершения.", COLOR_TEXT_DIM)
+        add_log("─" * 58, COLOR_TEXT_DIM)
+
+        # 5. Запуск фонового потока, выполняющего только sniff()
+        def run_sniff():
             try:
                 sniff(
                     iface=selected_iface_name,
@@ -510,6 +510,7 @@ def main(page: ft.Page):
                 add_log(f"[!] Ошибка Scapy sniff: {ex}", COLOR_DANGER, bold=True)
 
             # На случай непредвиденного завершения (если sniffer_active еще True)
+            global sniffer_active, antidote_active
             if sniffer_active:
                 sniffer_active = False
                 antidote_active = False
@@ -545,8 +546,7 @@ def main(page: ft.Page):
                 )
                 page.update()
 
-        # Запускаем в отдельном потоке
-        sniff_thread = threading.Thread(target=init_and_sniff, daemon=True)
+        sniff_thread = threading.Thread(target=run_sniff, daemon=True)
         sniff_thread.start()
 
     # ──────────────────────────────────────────────────
