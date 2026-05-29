@@ -128,38 +128,28 @@ def get_ip_from_arp_cache(mac_address: str) -> str | None:
 
 
 def ban_attacker(attacker_ip: str):
-    """Блокирует IP атакующего через Брандмауэр Windows."""
     try:
-        cmd = (
-            f'netsh advfirewall firewall add rule '
-            f'name="BLOCK_ARP_ATTACKER" dir=in action=block remoteip={attacker_ip}'
-        )
-        subprocess.run(cmd, shell=True, check=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        cmd_in = f'netsh advfirewall firewall add rule name="BLOCK_ARP_ATTACKER_IN" dir=in action=block remoteip={attacker_ip} protocol=any'
+        subprocess.run(cmd_in, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        
+        cmd_out = f'netsh advfirewall firewall add rule name="BLOCK_ARP_ATTACKER_OUT" dir=out action=block remoteip={attacker_ip} protocol=any'
+        subprocess.run(cmd_out, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         pass
 
 
 def unban_attacker(attacker_ip: str):
-    """Разблокирует IP атакующего через Брандмауэр Windows."""
     try:
-        cmd = (
-            f'netsh advfirewall firewall delete rule '
-            f'name="BLOCK_ARP_ATTACKER" remoteip={attacker_ip}'
-        )
-        subprocess.run(cmd, shell=True, check=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(f'netsh advfirewall firewall delete rule name="BLOCK_ARP_ATTACKER_IN" remoteip={attacker_ip}', shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(f'netsh advfirewall firewall delete rule name="BLOCK_ARP_ATTACKER_OUT" remoteip={attacker_ip}', shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         pass
 
 
 def cleanup_firewall_rule():
-    """Удаляет правило брандмауэра при закрытии приложения."""
     try:
-        subprocess.run(
-            'netsh advfirewall firewall delete rule name="BLOCK_ARP_ATTACKER"',
-            shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
+        subprocess.run('netsh advfirewall firewall delete rule name="BLOCK_ARP_ATTACKER_IN"', shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run('netsh advfirewall firewall delete rule name="BLOCK_ARP_ATTACKER_OUT"', shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         pass
 
