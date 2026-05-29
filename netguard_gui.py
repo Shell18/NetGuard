@@ -710,4 +710,4 @@ def main(page: ft.Page):
 #  ТОЧКА ВХОДА (Flet 0.80+: run() вместо app())
 # ──────────────────────────────────────────────────
 if __name__ == "__main__":
-    ft.run(target=main)
+    ft.run(main)
