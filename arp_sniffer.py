@@ -12,13 +12,18 @@ selected_iface_name = None
 sniffer_active = False
 antidote_active = False
 
-def get_gateway_ip():
+def get_gateway_ip(iface_name=None):
     """
     Автоматически определяет IP-адрес шлюза (роутера) по умолчанию
-    через таблицу маршрутизации Scapy.
+    для указанного интерфейса или через глобальную таблицу маршрутизации.
     """
     try:
-        # conf.route.route("0.0.0.0") возвращает (интерфейс, IP_выхода, IP_шлюза)
+        if iface_name:
+            for dest, netmask, gateway, interface, output_ip, metric in conf.route.routes:
+                if dest == 0 and netmask == 0 and interface == iface_name:
+                    if gateway and gateway != "0.0.0.0":
+                        return gateway
+            return None  # Не перенаправляем на шлюз другого интерфейса
         _, _, gw_ip = conf.route.route("0.0.0.0")
         if gw_ip and gw_ip != "0.0.0.0":
             return gw_ip
@@ -50,30 +55,41 @@ def get_mac_from_arp_cache(ip_address):
 def get_gateway_mac(ip_address, iface_name):
     """
     Определяет честный MAC-адрес шлюза.
-    Сначала отправляет активный ARP-запрос через Scapy srp1.
-    Если не удается (таймаут или отсутствие прав), пробует прочитать системный ARP-кэш.
+    Сначала проверяет системный кэш ARP (очень быстро, <50мс).
+    Если не удается, пробует отправить активный ARP-запрос через Scapy srp1.
     Если оба способа не сработали, просит пользователя ввести вручную.
     """
-    print(f"[*] Шаг 1: Отправка активного ARP-запроса на {ip_address} через интерфейс {iface_name}...")
-    
+    print(f"[*] Проверка системного ARP-кэша для IP {ip_address}...")
+    cached_mac = get_mac_from_arp_cache(ip_address)
+    if cached_mac:
+        print(f"[+] Найден MAC-адрес в системном кэше: {cached_mac}")
+        return cached_mac
+
+    try:
+        # Быстрый пинг для наполнения системного ARP-кэша
+        subprocess.run(["ping", "-n", "1", "-w", "500", ip_address],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+    cached_mac = get_mac_from_arp_cache(ip_address)
+    if cached_mac:
+        print(f"[+] Найден MAC-адрес в системном кэше (после пинга): {cached_mac}")
+        return cached_mac
+
+    print(f"[*] Отправка активного ARP-запроса на {ip_address} через интерфейс {iface_name}...")
     try:
         # Создаем ARP-запрос: L2 Ether-фрейм на широковещательный адрес ff:ff:ff:ff:ff:ff
         # оборачивает L3 ARP-запрос к нужному IP
         arp_pkt = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=ip_address)
         # Отправляем и ждем один ответ
-        ans = srp1(arp_pkt, iface=iface_name, timeout=2, verbose=False)
+        ans = srp1(arp_pkt, iface=iface_name, timeout=1.5, verbose=False)
         if ans and ARP in ans:
             mac = ans[ARP].hwsrc.lower()
             print(f"[+] Успешно получен MAC-адрес шлюза: {mac} (через ARP-запрос)")
             return mac
     except Exception as e:
         print(f"[-] Активный ARP-запрос завершился ошибкой (возможно, нет прав администратора): {e}")
-        
-    print(f"[*] Шаг 2: Попытка получить MAC-адрес из системного ARP-кэша...")
-    cached_mac = get_mac_from_arp_cache(ip_address)
-    if cached_mac:
-        print(f"[+] Найден MAC-адрес в системном кэше: {cached_mac}")
-        return cached_mac
         
     print(f"\n[!] Не удалось автоматически определить MAC-адрес для IP {ip_address}.")
     while True:
@@ -179,7 +195,7 @@ def show_interfaces():
         
     for index, iface in enumerate(ifaces_list):
         # Извлекаем основные характеристики интерфейса:
-        name = iface.name                 # Имя интерфейса в системе (в Windows это обычно GUID, например, \Device\NPF_{...})
+        name = getattr(iface, "network_name", iface.name)  # Имя интерфейса в системе (в Windows это обычно GUID, например, \Device\NPF_{...})
         description = iface.description   # Понятное описание (например, "Intel(R) Wireless-AC 9560" или "Realtek PCIe GbE Family Controller")
         ip = iface.ip if iface.ip else "Нет IP"  # IP-адрес, привязанный к интерфейсу
         mac = iface.mac if iface.mac else "Нет MAC"  # Физический (MAC) адрес интерфейса
@@ -202,7 +218,7 @@ def select_interface(ifaces_list):
             if 0 <= idx < len(ifaces_list):
                 selected = ifaces_list[idx]
                 print(f"\n[+] Выбран интерфейс: {selected.description}")
-                print(f"    Системное имя (Scapy): {selected.name}")
+                print(f"    Системное имя (Scapy): {getattr(selected, 'network_name', selected.name)}")
                 return selected
             else:
                 print(f"[-] Неверный номер. Пожалуйста, введите число от 0 до {len(ifaces_list) - 1}.")
@@ -276,12 +292,12 @@ def main():
         # 1. Получаем список интерфейсов и даем пользователю выбрать нужный
         ifaces = show_interfaces()
         selected_iface = select_interface(ifaces)
-        selected_iface_name = selected_iface.name
+        selected_iface_name = getattr(selected_iface, "network_name", selected_iface.name)
         
         # 2. Детектируем шлюз по умолчанию
         print("\n[*] Определение IP-адреса шлюза по умолчанию...")
         conf.route.resync()  # Сброс сетевого кэша Scapy
-        detected_ip = get_gateway_ip()
+        detected_ip = get_gateway_ip(selected_iface_name)
         if detected_ip:
             print(f"[+] Обнаружен IP-адрес шлюза: {detected_ip}")
             gateway_ip = detected_ip
@@ -298,7 +314,7 @@ def main():
 
         # 3. Разрешаем MAC-адрес шлюза для создания "Белого эталона"
         print(f"\n[*] Определение эталонного MAC-адреса для шлюза {gateway_ip}...")
-        gateway_mac = get_gateway_mac(gateway_ip, selected_iface.name)
+        gateway_mac = get_gateway_mac(gateway_ip, selected_iface_name)
         
         print("\n" + "=" * 60)
         print("                БЕЛЫЙ ЭТАЛОН (УСТАНОВЛЕН)")
@@ -318,7 +334,7 @@ def main():
         
         # 4. Запускаем бесконечный sniff()
         # count=0 означает бесконечный захват
-        sniff(iface=selected_iface.name, filter="arp", prn=arp_callback, store=0, count=0, stop_filter=lambda p: not sniffer_active)
+        sniff(iface=selected_iface_name, filter="arp", prn=arp_callback, store=0, count=0, stop_filter=lambda p: not sniffer_active)
         
     except PermissionError:
         print("\n[-] Ошибка прав доступа!")

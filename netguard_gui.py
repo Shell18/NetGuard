@@ -15,6 +15,7 @@ import threading
 import time
 import ctypes
 import winsound
+import queue
 import flet as ft
 
 # Flet 0.85+: Padding/Margin/Border/BorderSide доступны через ft напрямую
@@ -33,14 +34,24 @@ selected_iface_name: str | None = None
 sniffer_active: bool = False
 antidote_active: bool = False
 sniff_thread: threading.Thread | None = None
+log_queue = queue.Queue()
+raw_packet_queue = queue.Queue()
 
 # ──────────────────────────────────────────────────
 #  ВСПОМОГАТЕЛЬНЫЕ СЕТЕВЫЕ ФУНКЦИИ
 # ──────────────────────────────────────────────────
 
-def get_gateway_ip() -> str | None:
-    """Определяет IP шлюза по умолчанию через таблицу маршрутизации Scapy."""
+def get_gateway_ip(iface_name: str | None = None) -> str | None:
+    """
+    Определяет IP шлюза по умолчанию для выбранного интерфейса.
+    """
     try:
+        if iface_name:
+            for dest, netmask, gateway, interface, output_ip, metric in conf.route.routes:
+                if dest == 0 and netmask == 0 and interface == iface_name:
+                    if gateway and gateway != "0.0.0.0":
+                        return gateway
+            return None  # Не перенаправляем на шлюз другого интерфейса
         _, _, gw_ip = conf.route.route("0.0.0.0")
         if gw_ip and gw_ip != "0.0.0.0":
             return gw_ip
@@ -66,18 +77,37 @@ def get_mac_from_arp_cache(ip_address: str) -> str | None:
 
 def get_gateway_mac(ip_address: str, iface_name: str) -> str | None:
     """
-    Определяет MAC шлюза:
-    1) Активный ARP-запрос через Scapy srp1
-    2) Fallback — системный кэш ARP
+    Определяет MAC-адрес шлюза.
+    Сначала проверяет системный кэш ARP (очень быстро, <50мс).
+    Если там нет, пробует разогреть кэш пингом и отправить ARP-запрос Scapy.
     """
+    # 1. Сначала ищем в системном кэше (самый быстрый и безопасный способ)
+    cached_mac = get_mac_from_arp_cache(ip_address)
+    if cached_mac:
+        return cached_mac
+
+    # 2. Если в кэше нет, пробуем разогреть пингом
+    try:
+        subprocess.run(["ping", "-n", "1", "-w", "500", ip_address],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+    # Сразу после пинга проверяем кэш снова
+    cached_mac = get_mac_from_arp_cache(ip_address)
+    if cached_mac:
+        return cached_mac
+
+    # 3. Как крайняя мера — активный ARP-запрос Scapy srp1
     try:
         pkt = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=ip_address)
-        ans = srp1(pkt, iface=iface_name, timeout=2, verbose=False)
+        ans = srp1(pkt, iface=iface_name, timeout=1.5, verbose=False)
         if ans and ARP in ans:
             return ans[ARP].hwsrc.lower()
     except Exception:
         pass
-    return get_mac_from_arp_cache(ip_address)
+
+    return None
 
 
 def get_ip_from_arp_cache(mac_address: str) -> str | None:
@@ -188,46 +218,60 @@ def main(page: ft.Page):
     log_list       = ft.Ref[ft.ListView]()
 
     # ──────────────────────────────────────────────────
-    #  ЛОГИРОВАНИЕ В UI
+    #  ЛОГИРОВАНИЕ В UI (Буферизованное)
     # ──────────────────────────────────────────────────
     def add_log(text: str, color: str = COLOR_TEXT, bold: bool = False):
         """
-        Добавляет строку лога в ListView (снизу экрана).
-
-        КЛЮЧЕВОЙ МОМЕНТ ИНТЕГРАЦИИ Scapy → Flet:
-        Scapy работает в фоновом потоке (sniff_thread).
-        Чтобы безопасно обновить UI из стороннего потока,
-        мы изменяем .controls у ListView и затем вызываем
-        log_list.current.update() — обновление только этого
-        контрола без блокировки основного UI-потока.
+        Add log parameters to the queue for background dispatcher to process.
         """
+        global log_queue
         ts = time.strftime("%H:%M:%S")
-        entry = ft.Text(
-            f"[{ts}]  {text}",
-            color=color,
-            size=11,
-            weight=ft.FontWeight.BOLD if bold else ft.FontWeight.NORMAL,
-            selectable=True,
-        )
-        log_list.current.controls.append(entry)
-        # Ограничиваем историю лога (500 строк)
-        if len(log_list.current.controls) > 500:
-            log_list.current.controls.pop(0)
-        # Обновляем только ListView, не всю страницу — эффективнее
-        log_list.current.update()
+        log_queue.put({"text": f"[{ts}]  {text}", "color": color, "bold": bold})
+
+    async def update_logs_ui(new_controls):
+        if log_list.current:
+            log_list.current.controls.extend(new_controls)
+            if len(log_list.current.controls) > 200:
+                del log_list.current.controls[:-200]
+            log_list.current.update()
+
+    def log_dispatcher():
+        global log_queue
+        while True:
+            try:
+                time.sleep(0.1)
+                if not log_list.current or log_queue.empty():
+                    continue
+
+                new_controls = []
+                while not log_queue.empty():
+                    item = log_queue.get_nowait()
+                    new_controls.append(
+                        ft.Text(
+                            item["text"],
+                            color=item["color"],
+                            size=11,
+                            weight=ft.FontWeight.BOLD if item["bold"] else ft.FontWeight.NORMAL,
+                            selectable=True,
+                        )
+                    )
+                    log_queue.task_done()
+
+                if new_controls:
+                    page.run_task(update_logs_ui, new_controls)
+            except Exception:
+                pass
+
+    threading.Thread(target=log_dispatcher, daemon=True).start()
 
     # ──────────────────────────────────────────────────
     #  РЕЖИМ ТРЕВОГИ
     # ──────────────────────────────────────────────────
-    def trigger_alert(attacker_mac: str, attacker_ip: str | None):
+    async def trigger_alert_ui(attacker_mac: str, attacker_ip: str | None):
         """
         Визуальная и звуковая тревога при обнаружении атаки.
-        Вызывается из потока sniff_thread.
-
-        После изменения нескольких контролов вызываем page.update()
-        для применения всех изменений за один проход рендера.
+        Вызывается асинхронно в основном потоке Flet.
         """
-        # Красим панель статуса в красный
         status_panel.current.bgcolor = COLOR_DANGER_DIM
         status_panel.current.border = Border(
             top=BorderSide(2, COLOR_DANGER),
@@ -235,19 +279,15 @@ def main(page: ft.Page):
             bottom=BorderSide(2, COLOR_DANGER),
             left=BorderSide(2, COLOR_DANGER),
         )
-        # Меняем текст статуса
         status_text.current.value = "⚠  ВНИМАНИЕ: ОБНАРУЖЕНА КИБЕРАТАКА!"
         status_text.current.color = COLOR_DANGER
         status_text.current.size  = 20
 
-        # Единый вызов page.update() применяет все изменения сразу
         page.update()
 
-        # Звук тревоги — в отдельном мини-потоке, чтобы не блокировать sniff
         threading.Thread(target=winsound.Beep, args=(2000, 1000), daemon=True).start()
 
-        # Лог-сообщения об атаке
-        add_log("═" * 58, COLOR_DANGER, bold=True)
+        add_log("=" * 58, COLOR_DANGER, bold=True)
         add_log("ОБНАРУЖЕН ARP-SPOOFING РОУТЕРА!", COLOR_DANGER, bold=True)
         add_log(f"Шлюз (IP):       {gateway_ip}", COLOR_DANGER)
         add_log(f"Эталонный MAC:   {gateway_mac}", COLOR_DANGER)
@@ -255,89 +295,180 @@ def main(page: ft.Page):
         if attacker_ip:
             add_log(f"IP атакующего:   {attacker_ip}", COLOR_DANGER)
             add_log(f"[+] Запущена функция БАНА для IP: {attacker_ip}", COLOR_DANGER, bold=True)
-        add_log("═" * 58, COLOR_DANGER, bold=True)
+        add_log("=" * 58, COLOR_DANGER, bold=True)
+
+    async def activate_antidote_ui():
+        """Активирует оранжевую кнопку остановки антидота в UI."""
+        if btn_stop_antidote.current:
+            btn_stop_antidote.current.disabled = False
+            btn_stop_antidote.current.bgcolor = ft.Colors.ORANGE_800
+            btn_stop_antidote.current.content = ft.Row(
+                [ft.Icon(ft.Icons.STOP, size=16, color=ft.Colors.WHITE),
+                 ft.Text("💊 ОСТАНОВИТЬ АНТИДОТ", size=14, weight=ft.FontWeight.BOLD, color=ft.Colors.WHITE)],
+                spacing=8, tight=True
+            )
+            page.update()
+
+    async def restore_start_button_ui():
+        """Возвращает кнопку защиты в исходное состояние при ошибке инициализации."""
+        if start_btn.current:
+            start_btn.current.disabled = False
+            start_btn.current.content = ft.Row(
+                [ft.Icon(ft.Icons.SHIELD, size=16), ft.Text("ВКЛЮЧИТЬ ЗАЩИТУ", size=14, weight=ft.FontWeight.BOLD)],
+                spacing=8, tight=True
+            )
+            start_btn.current.bgcolor = COLOR_ACCENT_DIM
+            page.update()
+
+    async def update_protection_active_ui(gw_ip: str, gw_mac: str):
+        """Обновляет статус и элементы управления при успешном включении защиты."""
+        if router_ip_text.current:
+            router_ip_text.current.value  = f"IP роутера:   {gw_ip}"
+        if router_mac_text.current:
+            router_mac_text.current.value = f"MAC эталон:  {gw_mac}"
+        if status_text.current:
+            status_text.current.value     = "🛡  Сеть под защитой"
+            status_text.current.color     = COLOR_SUCCESS
+            status_text.current.size      = 22
+        if status_panel.current:
+            status_panel.current.bgcolor  = COLOR_SUCCESS_BG
+            status_panel.current.border   = Border(
+                top=BorderSide(2, COLOR_SUCCESS),
+                right=BorderSide(2, COLOR_SUCCESS),
+                bottom=BorderSide(2, COLOR_SUCCESS),
+                left=BorderSide(2, COLOR_SUCCESS),
+            )
+        
+        if start_btn.current:
+            start_btn.current.disabled = False
+            start_btn.current.content = ft.Row(
+                [ft.Icon(ft.Icons.SHIELD, size=16, color=ft.Colors.WHITE),
+                 ft.Text("🛑 ОСТАНОВИТЬ ЗАЩИТУ", size=14, weight=ft.FontWeight.BOLD, color=ft.Colors.WHITE)],
+                spacing=8, tight=True
+            )
+            start_btn.current.bgcolor = COLOR_DANGER
+            start_btn.current.color = ft.Colors.WHITE
+        
+        page.update()
+
+    async def reset_protection_ui():
+        """Сбрасывает все UI-элементы в состояние ожидания."""
+        if status_text.current:
+            status_text.current.value     = "⬤  ОЖИДАНИЕ ЗАПУСКА"
+            status_text.current.color     = COLOR_TEXT_DIM
+            status_text.current.size      = 22
+        if status_panel.current:
+            status_panel.current.bgcolor  = COLOR_PANEL
+            status_panel.current.border   = Border(
+                top=BorderSide(2, COLOR_BORDER),
+                right=BorderSide(2, COLOR_BORDER),
+                bottom=BorderSide(2, COLOR_BORDER),
+                left=BorderSide(2, COLOR_BORDER),
+            )
+        if router_ip_text.current:
+            router_ip_text.current.value  = "IP роутера:   —"
+        if router_mac_text.current:
+            router_mac_text.current.value = "MAC эталон:  —"
+        
+        if start_btn.current:
+            start_btn.current.content = ft.Row(
+                [ft.Icon(ft.Icons.SHIELD, size=16, color=COLOR_ACCENT),
+                 ft.Text("ВКЛЮЧИТЬ ЗАЩИТУ", size=14, weight=ft.FontWeight.BOLD, color=COLOR_ACCENT)],
+                spacing=8, tight=True
+            )
+            start_btn.current.bgcolor = COLOR_ACCENT_DIM
+            start_btn.current.color = COLOR_ACCENT
+        
+        if btn_stop_antidote.current:
+            btn_stop_antidote.current.disabled = True
+            btn_stop_antidote.current.bgcolor = None
+            btn_stop_antidote.current.content = ft.Row(
+                [ft.Icon(ft.Icons.STOP, size=16, color=COLOR_TEXT_DIM),
+                 ft.Text("Антидот выключен", size=14, weight=ft.FontWeight.BOLD, color=COLOR_TEXT_DIM)],
+                spacing=8, tight=True
+            )
+        page.update()
 
     # ──────────────────────────────────────────────────
     #  SCAPY ARP CALLBACK
     # ──────────────────────────────────────────────────
+    # ──────────────────────────────────────────────────
+    #  SCAPY ARP CALLBACK (Producer)
+    # ──────────────────────────────────────────────────
     def arp_callback(packet):
         """
-        Вызывается Scapy для каждого ARP-пакета. Работает в sniff_thread.
-
-        СВЯЗЬ SCAPY → FLET:
-        Каждый перехваченный пакет формирует строку лога.
-        add_log() добавляет ft.Text в ListView и вызывает
-        log_list.current.update() для немедленного отображения
-        без блокировки UI-потока.
+        Сверхбыстрый колбэк (Producer). Помещает сырой ARP-пакет в очередь.
         """
-        global gateway_ip, gateway_mac, selected_iface_name, antidote_active
+        if ARP in packet:
+            raw_packet_queue.put(packet[ARP])
 
-        try:
-            if ARP not in packet:
-                return
+    def packet_analyzer_worker():
+        """
+        Фоновый поток-консьюмер. Извлекает перехваченные пакеты из raw_packet_queue
+        и выполняет их детальный анализ, логирование и запуск тревоги.
+        """
+        global gateway_ip, gateway_mac, selected_iface_name, antidote_active, sniffer_active
+        while sniffer_active:
+            try:
+                # Читаем пакет из очереди с таймаутом, чтобы не зависать при остановке защиты
+                arp = raw_packet_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
 
-            arp     = packet[ARP]
-            op_code = arp.op
-            src_ip  = arp.psrc
-            src_mac = arp.hwsrc
-            dst_ip  = arp.pdst
+            try:
+                op_code = arp.op
+                src_ip  = arp.psrc
+                src_mac = arp.hwsrc
+                dst_ip  = arp.pdst
 
-            if op_code == 1:
-                add_log(
-                    f"[ЗАПРОС]  Кто {dst_ip}? → спросил {src_ip} ({src_mac})",
-                    COLOR_TEXT_DIM
-                )
-            elif op_code == 2:
-                add_log(
-                    f"[ОТВЕТ]   {src_ip} → MAC: {src_mac}  (для {dst_ip})",
-                    COLOR_TEXT
-                )
+                if op_code == 1:
+                    add_log(
+                        f"[ЗАПРОС]  Кто {dst_ip}? → спросил {src_ip} ({src_mac})",
+                        COLOR_TEXT_DIM
+                    )
+                elif op_code == 2:
+                    add_log(
+                        f"[ОТВЕТ]   {src_ip} → MAC: {src_mac}  (для {dst_ip})",
+                        COLOR_TEXT
+                    )
 
-                # ── ДЕТЕКТОР ARP-SPOOFING ─────────────────────────
-                if gateway_ip and src_ip == gateway_ip:
-                    if src_mac.lower() != gateway_mac.lower():
-                        attacker_ip = get_ip_from_arp_cache(src_mac)
+                    # ── ДЕТЕКТОР ARP-SPOOFING ─────────────────────────
+                    if gateway_ip and src_ip == gateway_ip:
+                        if src_mac.lower() != gateway_mac.lower():
+                            attacker_ip = get_ip_from_arp_cache(src_mac)
 
-                        if attacker_ip:
-                            ban_attacker(attacker_ip)
+                            if attacker_ip:
+                                ban_attacker(attacker_ip)
 
-                        # Запускаем ARP-антидот (только один раз)
-                        if not antidote_active:
-                            antidote_active = True
-                            add_log(
-                                "[+] АКТИВИРОВАН ARP-АНТИДОТ: Подавление атаки в локальной сети...",
-                                COLOR_SUCCESS, bold=True
-                            )
-                            
-                            # Активируем кнопку антидота
-                            btn_stop_antidote.current.disabled = False
-                            btn_stop_antidote.current.bgcolor = ft.colors.ORANGE_800
-                            btn_stop_antidote.current.content = ft.Row(
-                                [ft.Icon(ft.Icons.STOP, size=16, color=ft.colors.WHITE),
-                                 ft.Text("💊 ОСТАНОВИТЬ АНТИДОТ", size=14, weight=ft.FontWeight.BOLD, color=ft.colors.WHITE)],
-                                spacing=8, tight=True
-                            )
-                            
-                            threading.Thread(
-                                target=antidote_worker,
-                                args=(gateway_ip, gateway_mac, selected_iface_name),
-                                daemon=True
-                            ).start()
+                            # Запускаем ARP-антидот (только один раз)
+                            if not antidote_active:
+                                antidote_active = True
+                                add_log(
+                                    "[+] АКТИВИРОВАН ARP-АНТИДОТ: Подавление атаки в локальной сети...",
+                                    COLOR_SUCCESS, bold=True
+                                )
+                                
+                                # Активируем кнопку антидота асинхронно
+                                page.run_task(activate_antidote_ui)
+                                
+                                threading.Thread(
+                                    target=antidote_worker,
+                                    args=(gateway_ip, gateway_mac, selected_iface_name),
+                                    daemon=True
+                                ).start()
 
-                        # Активируем тревогу в UI
-                        trigger_alert(src_mac, attacker_ip)
-            else:
-                add_log(
-                    f"[ИНОЕ op={op_code}]  {src_ip} ({src_mac}) → {dst_ip}",
-                    COLOR_TEXT_DIM
-                )
+                            # Активируем тревогу в UI асинхронно
+                            page.run_task(trigger_alert_ui, src_mac, attacker_ip)
+                else:
+                    add_log(
+                        f"[ИНОЕ op={op_code}]  {src_ip} ({src_mac}) → {dst_ip}",
+                        COLOR_TEXT_DIM
+                    )
+            except Exception as ex:
+                add_log(f"[!] Ошибка анализа пакета: {ex}", COLOR_DANGER)
+            finally:
+                raw_packet_queue.task_done()
 
-        except Exception as ex:
-            add_log(f"[!] Ошибка парсинга пакета: {ex}", COLOR_DANGER)
-
-    # ──────────────────────────────────────────────────
-    #  ЗАПУСК ЗАЩИТЫ (обработчик кнопки)
-    # ──────────────────────────────────────────────────
     # ──────────────────────────────────────────────────
     #  ОБРАБОТЧИК КНОПКИ АНТИДОТА
     # ──────────────────────────────────────────────────
@@ -414,89 +545,71 @@ def main(page: ft.Page):
 
         # Блокируем кнопку на время инициализации
         start_btn.current.disabled = True
-        start_btn.current.content = ft.Text("Инициализация...", size=14, weight=ft.FontWeight.BOLD)
+        start_btn.current.content = ft.Row(
+            [ft.ProgressRing(width=16, height=16, stroke_width=2, color=COLOR_ACCENT),
+             ft.Text("Инициализация...", size=14, weight=ft.FontWeight.BOLD)],
+            spacing=8, tight=True
+        )
         start_btn.current.bgcolor = "#1A3A4A"
         page.update()
 
-        # 1. Сброс сетевого кэша Scapy в главном GUI-потоке при клике на кнопку
-        try:
-            conf.route.resync()
-        except Exception as ex:
-            add_log(f"[!] Не удалось сбросить кэш Scapy: {ex}", COLOR_TEXT_DIM)
+        def init_and_sniff():
+            global gateway_ip, gateway_mac, selected_iface_name
+            global sniffer_active, antidote_active
 
-        # 2. Микропауза 0.3 сек для обновления таблиц в Windows
-        time.sleep(0.3)
+            # 1. Сброс сетевого кэша Scapy
+            try:
+                conf.route.resync()
+            except Exception as ex:
+                add_log(f"[!] Не удалось сбросить кэш Scapy: {ex}", COLOR_TEXT_DIM)
 
-        selected_iface_name = iface_dropdown.current.value
-        antidote_active     = False
+            # 2. Микропауза 0.3 сек для обновления таблиц в Windows
+            time.sleep(0.3)
 
-        # 3. Определение IP шлюза в главном потоке
-        add_log("[*] Определение IP-адреса шлюза по умолчанию...", COLOR_ACCENT)
-        gw_ip = get_gateway_ip()
-        if not gw_ip:
-            add_log("[!] Не удалось определить IP шлюза автоматически.", COLOR_DANGER, bold=True)
-            start_btn.current.disabled = False
-            start_btn.current.content = ft.Row(
-                [ft.Icon(ft.Icons.SHIELD, size=16), ft.Text("ВКЛЮЧИТЬ ЗАЩИТУ", size=14, weight=ft.FontWeight.BOLD)],
-                spacing=8, tight=True
-            )
-            start_btn.current.bgcolor = COLOR_ACCENT_DIM
-            page.update()
-            return
+            selected_iface_name = iface_dropdown.current.value
+            antidote_active     = False
 
-        gateway_ip = gw_ip
-        add_log(f"[+] Шлюз обнаружен: {gateway_ip}", COLOR_SUCCESS)
+            # 3. Определение IP шлюза
+            add_log("[*] Определение IP-адреса шлюза по умолчанию...", COLOR_ACCENT)
+            gw_ip = get_gateway_ip(selected_iface_name)
+            if not gw_ip:
+                add_log("[!] Не удалось определить IP шлюза автоматически.", COLOR_DANGER, bold=True)
+                page.run_task(restore_start_button_ui)
+                return
 
-        # 4. Определение эталонного MAC шлюза в главном потоке
-        add_log(f"[*] Получение эталонного MAC-адреса для {gateway_ip}...", COLOR_ACCENT)
-        gw_mac = get_gateway_mac(gateway_ip, selected_iface_name)
-        if not gw_mac:
-            add_log("[!] Не удалось определить MAC шлюза.", COLOR_DANGER, bold=True)
-            start_btn.current.disabled = False
-            start_btn.current.content = ft.Row(
-                [ft.Icon(ft.Icons.SHIELD, size=16), ft.Text("ВКЛЮЧИТЬ ЗАЩИТУ", size=14, weight=ft.FontWeight.BOLD)],
-                spacing=8, tight=True
-            )
-            start_btn.current.bgcolor = COLOR_ACCENT_DIM
-            page.update()
-            return
+            gateway_ip = gw_ip
+            add_log(f"[+] Шлюз обнаружен: {gateway_ip}", COLOR_SUCCESS)
 
-        gateway_mac = gw_mac
-        sniffer_active = True
+            # 4. Определение эталонного MAC шлюза
+            add_log(f"[*] Получение эталонного MAC-адреса для {gateway_ip}...", COLOR_ACCENT)
+            gw_mac = get_gateway_mac(gateway_ip, selected_iface_name)
+            if not gw_mac:
+                add_log("[!] Не удалось определить MAC шлюза.", COLOR_DANGER, bold=True)
+                page.run_task(restore_start_button_ui)
+                return
 
-        # Обновление UI в главном потоке
-        router_ip_text.current.value  = f"IP роутера:   {gateway_ip}"
-        router_mac_text.current.value = f"MAC эталон:  {gateway_mac}"
-        status_text.current.value     = "🛡  Сеть под защитой"
-        status_text.current.color     = COLOR_SUCCESS
-        status_text.current.size      = 22
-        status_panel.current.bgcolor  = COLOR_SUCCESS_BG
-        status_panel.current.border   = Border(
-            top=BorderSide(2, COLOR_SUCCESS),
-            right=BorderSide(2, COLOR_SUCCESS),
-            bottom=BorderSide(2, COLOR_SUCCESS),
-            left=BorderSide(2, COLOR_SUCCESS),
-        )
-        
-        # Меняем кнопку запуска на кнопку остановки (красная)
-        start_btn.current.disabled = False
-        start_btn.current.content = ft.Row(
-            [ft.Icon(ft.Icons.SHIELD, size=16, color=ft.colors.WHITE),
-             ft.Text("🛑 ОСТАНОВИТЬ ЗАЩИТУ", size=14, weight=ft.FontWeight.BOLD, color=ft.colors.WHITE)],
-            spacing=8, tight=True
-        )
-        start_btn.current.bgcolor = COLOR_DANGER
-        start_btn.current.color = ft.colors.WHITE
-        page.update()
+            gateway_mac = gw_mac
+            sniffer_active = True
 
-        add_log(f"[+] Эталонный MAC зафиксирован: {gateway_mac}", COLOR_SUCCESS, bold=True)
-        add_log("─" * 58, COLOR_TEXT_DIM)
-        add_log("[*] Активный мониторинг ARP-трафика запущен...", COLOR_ACCENT, bold=True)
-        add_log("[*] Закройте окно для завершения.", COLOR_TEXT_DIM)
-        add_log("─" * 58, COLOR_TEXT_DIM)
+            # Очищаем старую очередь пакетов перед началом нового сканирования
+            while not raw_packet_queue.empty():
+                try:
+                    raw_packet_queue.get_nowait()
+                except Exception:
+                    break
 
-        # 5. Запуск фонового потока, выполняющего только sniff()
-        def run_sniff():
+            # Запускаем фоновый поток анализа пакетов (Consumer)
+            threading.Thread(target=packet_analyzer_worker, daemon=True).start()
+
+            # Обновление UI в главном потоке
+            page.run_task(update_protection_active_ui, gateway_ip, gateway_mac)
+
+            add_log(f"[+] Эталонный MAC зафиксирован: {gateway_mac}", COLOR_SUCCESS, bold=True)
+            add_log("─" * 58, COLOR_TEXT_DIM)
+            add_log("[*] Активный мониторинг ARP-трафика запущен...", COLOR_ACCENT, bold=True)
+            add_log("[*] Закройте окно для завершения.", COLOR_TEXT_DIM)
+            add_log("─" * 58, COLOR_TEXT_DIM)
+
             try:
                 sniff(
                     iface=selected_iface_name,
@@ -510,43 +623,13 @@ def main(page: ft.Page):
                 add_log(f"[!] Ошибка Scapy sniff: {ex}", COLOR_DANGER, bold=True)
 
             # На случай непредвиденного завершения (если sniffer_active еще True)
-            global sniffer_active, antidote_active
             if sniffer_active:
                 sniffer_active = False
                 antidote_active = False
                 cleanup_firewall_rule()
-                
-                status_text.current.value     = "⬤  ОЖИДАНИЕ ЗАПУСКА"
-                status_text.current.color     = COLOR_TEXT_DIM
-                status_text.current.size      = 22
-                status_panel.current.bgcolor  = COLOR_PANEL
-                status_panel.current.border   = Border(
-                    top=BorderSide(2, COLOR_BORDER),
-                    right=BorderSide(2, COLOR_BORDER),
-                    bottom=BorderSide(2, COLOR_BORDER),
-                    left=BorderSide(2, COLOR_BORDER),
-                )
-                router_ip_text.current.value  = "IP роутера:   —"
-                router_mac_text.current.value = "MAC эталон:  —"
-                
-                start_btn.current.content = ft.Row(
-                    [ft.Icon(ft.Icons.SHIELD, size=16, color=COLOR_ACCENT),
-                     ft.Text("ВКЛЮЧИТЬ ЗАЩИТУ", size=14, weight=ft.FontWeight.BOLD, color=COLOR_ACCENT)],
-                    spacing=8, tight=True
-                )
-                start_btn.current.bgcolor = COLOR_ACCENT_DIM
-                start_btn.current.color = COLOR_ACCENT
-                
-                btn_stop_antidote.current.disabled = True
-                btn_stop_antidote.current.bgcolor = None
-                btn_stop_antidote.current.content = ft.Row(
-                    [ft.Icon(ft.Icons.STOP, size=16, color=COLOR_TEXT_DIM),
-                     ft.Text("Антидот выключен", size=14, weight=ft.FontWeight.BOLD, color=COLOR_TEXT_DIM)],
-                    spacing=8, tight=True
-                )
-                page.update()
+                page.run_task(reset_protection_ui)
 
-        sniff_thread = threading.Thread(target=run_sniff, daemon=True)
+        sniff_thread = threading.Thread(target=init_and_sniff, daemon=True)
         sniff_thread.start()
 
     # ──────────────────────────────────────────────────
@@ -584,20 +667,21 @@ def main(page: ft.Page):
         )
         
         if starts_with_pref and not has_exclude_word:
-            recommended_iface_name = iface.name
+            recommended_iface_name = getattr(iface, "network_name", iface.name)
             break
 
     dropdown_options = []
     for iface in ifaces_list:
-        ip_str = f" [{iface.ip}]" if iface.ip else " [нет IP]"
-        if iface.name == recommended_iface_name:
-            text = f"⭐ РЕКОМЕНДУЕТСЯ (Активная Сеть) — {iface.description}{ip_str}"
+        ip_str = f" [{iface.ip}]" if iface.ip else ""
+        iface_key = getattr(iface, "network_name", iface.name)
+        if iface_key == recommended_iface_name:
+            text = f"⭐ Рекомендуется — {iface.description}{ip_str}"
         else:
-            text = f"{iface.description}{ip_str} (Служебный/Виртуальный)"
+            text = f"{iface.description}{ip_str} (Служебный)"
             
         dropdown_options.append(
             ft.dropdown.Option(
-                key=iface.name,
+                key=iface_key,
                 text=text
             )
         )
