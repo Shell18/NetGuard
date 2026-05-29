@@ -1,3 +1,16 @@
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
+*.env
+venv/
+env/
+
+# Сборка в EXE (PyInstaller / Flet)
+build/
+dist/
+*.spec
+
+# IDE (VS Code, PyCharm)
+.vscode/
+.idea/
